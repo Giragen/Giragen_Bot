@@ -38,6 +38,7 @@ async def send_welcome(message: types.Message):
             [InlineKeyboardButton(text="📺 YouTube", callback_data="inline_youtube")],
             [InlineKeyboardButton(text="🎮 Twitch", callback_data="inline_twitch")],
             [InlineKeyboardButton(text="📹 VKLive", callback_data="inline_vklive")]
+            [InlineKeyboardButton(text="🖥️ Комплектующие", callback_data="inline_specs")]
         ]
     )
 
