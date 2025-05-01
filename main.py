@@ -17,8 +17,9 @@ if not API_TOKEN:
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-@dp.message(Command("start"))
+@dp.message(Command("/start"))
 async def send_welcome(message: types.Message):
+    # Reply-кнопки (внизу экрана)
     kb = [
         [types.KeyboardButton(text="YouTube")],
         [types.KeyboardButton(text="Twitch")],
@@ -30,7 +31,8 @@ async def send_welcome(message: types.Message):
         resize_keyboard=True,
         input_field_placeholder="Выберите платформу"
     )
-     # Inline-кнопки под сообщением
+
+    # Inline-кнопки (под сообщением)
     inline_kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📺 YouTube", callback_data="inline_youtube")],
@@ -38,8 +40,16 @@ async def send_welcome(message: types.Message):
             [InlineKeyboardButton(text="📹 VKLive", callback_data="inline_vklive")]
         ]
     )
-    await message.reply(
+
+    # Сначала отправляем сообщение с inline-кнопками
+    await message.answer(
         "Привет! Я бот от Giragen.\nПокажу ссылки на наши каналы:",
+        reply_markup=inline_kb
+    )
+
+    # Затем прикрепляем reply-клавиатуру
+    await message.answer(
+        "Выберите платформу:",
         reply_markup=keyboard
     )
 
