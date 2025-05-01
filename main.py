@@ -17,7 +17,7 @@ if not API_TOKEN:
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-@dp.message(Command("/start"))
+@dp.message(Command("start"))
 async def send_welcome(message: types.Message):
     # Reply-кнопки (внизу экрана)
     kb = [
