@@ -4,6 +4,8 @@ import asyncio
 import os
 from dotenv import load_dotenv
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import logging
+   logging.basicConfig(level=logging.INFO)
 
 # Загружаем переменные из .env файла
 load_dotenv()
