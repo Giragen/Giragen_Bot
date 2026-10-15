@@ -429,8 +429,7 @@ class UnriteBot(commands.Bot):
                 return
 
             await interaction.followup.send(
-                f"Готово! Твой личный архив: {archive_channel.mention}\n"
-                "Созданы приватные ветки: РП мероприятия, Arena, Capt и MCL.",
+                f"Канал создан: {archive_channel.mention}\n",
                 ephemeral=True,
             )
 
