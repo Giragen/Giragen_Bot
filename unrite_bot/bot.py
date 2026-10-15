@@ -191,12 +191,12 @@ class UnriteBot(commands.Bot):
         curator_text = f"Закреплён — {curator_role.mention}" if has_curator else "Не закреплён"
 
         embed = discord.Embed(
-            title="UNRITE • Личный архив игрока",
+            title="—・Личный текстовый канал участника",
             description=(
-                f"**Личный текстовый канал участника**\n{owner_label}\n\n"
-                "▸ Прикрепляйте сюда материалы и откаты.\n"
-                "▸ Используйте четыре приватные ветки для разделения активностей.\n"
-                "▸ Упоминание участника выдаёт ему доступ к каналу и всем веткам."
+                f"**Личный канал участника —**\n{owner_label}\n\n"
+                "▸ Присылайте в текстовый канал видео откатов с МП (желательно геймплей от 10 минут с сильными лобби).\n"
+                "▸ Изучайте залазы, это важно для участия в мейн-составе на CAPT\n"
+                "▸ Пожалуйста, прикрепляйте откаты с лучшей стрельбой и демонстрацией понимания игры."
             ),
             colour=discord.Colour.from_rgb(27, 28, 33),
         )
@@ -741,14 +741,14 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
         embed = discord.Embed(
             title="UNRITE • Получение ранга и Tier",
             description=(
-                "📁 **Создание личного архива**\n"
+                "📁 **Создание портфеля**\n"
                 "Нажмите кнопку ниже, чтобы создать персональный приватный канал.\n\n"
-                "Внутри будут четыре закрытые ветки: **РП мероприятия**, **Arena**, **Capt** и **MCL**.\n"
-                "По умолчанию архив виден владельцу и управляющим ролям. Упомяните участника, чтобы выдать ему доступ к архиву и всем веткам."
+                "▸ Участники @Rec в приватном канале оценят ваши откаты и решат — повысить вам тир или порекомендовать дополнительную тренировку, указав на допущенные ошибки..\n"
+                "▸ Видеоматериалы желательно заливать на видеохостинги Youtube, Rutube."
             ),
             colour=discord.Colour.from_rgb(27, 28, 33),
         )
-        embed.set_footer(text="Unrite • Личные архивы, ранги и тиры")
+        embed.set_footer(text="Создай личный канал → прикрепи откаты → @Rec и @Recruit определят твой Ранг и TIER")
         await channel.send(embed=embed, view=CreateArchiveView(self.bot))
         await self.bot.db.set_guild_setting(interaction.guild.id, "panel_channel_id", channel.id)
         await interaction.response.send_message(f"Панель Unrite опубликована в {channel.mention}.", ephemeral=True)
