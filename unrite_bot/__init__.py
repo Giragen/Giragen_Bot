@@ -1,0 +1,1 @@
+"""Unrite Discord bot package."""
