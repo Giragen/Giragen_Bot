@@ -836,7 +836,7 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
             ),
             colour=discord.Colour.from_rgb(27, 28, 33),
         )
-        embed.set_footer(text="Unrite • Личные архивы, ранги и тиры")
+        embed.set_footer(text="Создай личный канал → прикрепи откаты → @Rec и @Recruit определят твой Ранг и TIER")
         await channel.send(embed=embed, view=CreateArchiveView(self.bot))
         await self.bot.db.set_guild_setting(interaction.guild.id, "panel_channel_id", channel.id)
         await interaction.response.send_message(f"Панель Unrite опубликована в {channel.mention}.", ephemeral=True)
