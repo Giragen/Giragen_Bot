@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -14,12 +15,89 @@ from dotenv import load_dotenv
 
 from .database import ACTION_FEATURES, Database
 
-load_dotenv()
+# Always resolve .env and a relative SQLite path from the project directory,
+# not from Visual Studio's potentially different working directory.
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_DIR / ".env")
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()
 GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW.isdigit() else None
-DATABASE_PATH = os.getenv("DATABASE_PATH", "data/unrite.sqlite3")
+DATABASE_URL_RAW = os.getenv("DATABASE_URL", "").strip()
+DATABASE_PATH_RAW = os.getenv("DATABASE_PATH", "data/unrite.sqlite3").strip() or "data/unrite.sqlite3"
+_database_path = Path(DATABASE_PATH_RAW).expanduser()
+if not _database_path.is_absolute():
+    _database_path = (PROJECT_DIR / _database_path).resolve()
+
+
+def _existing_database_score(path: Path) -> int:
+    """Score an existing DB so an older, populated DB beats an empty accidental one."""
+    if not path.is_file():
+        return -1
+    try:
+        # This function only opens paths that already exist and executes SELECTs.
+        conn = sqlite3.connect(str(path), timeout=1)
+        try:
+            tables = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            relevant = {"archives", "guild_settings", "permissions", "tier_roles", "rank_roles"}
+            if not tables.intersection(relevant):
+                return -1
+            weights = {
+                "archives": 100,
+                "guild_settings": 10,
+                "permissions": 5,
+                "tier_roles": 5,
+                "rank_roles": 5,
+            }
+            score = 1
+            for table, weight in weights.items():
+                if table in tables:
+                    count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    score += min(int(count), 1000) * weight
+            return score
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return -1
+
+
+def _resolve_database_path(preferred: Path, raw_path: str) -> Path:
+    """Prefer the project-local DB, but recover a populated DB from common old CWDs."""
+    if Path(raw_path).expanduser().is_absolute():
+        return preferred
+    candidates = [preferred]
+    relative = Path(raw_path).expanduser()
+    bases = [PROJECT_DIR / "unrite_bot", PROJECT_DIR.parent, Path.cwd()]
+    bases.extend(list(Path.cwd().parents)[:3])
+    for base in bases:
+        candidate = (base / relative).resolve()
+        if candidate not in candidates:
+            candidates.append(candidate)
+    scores = [(candidate, _existing_database_score(candidate)) for candidate in candidates]
+    best_path, best_score = max(scores, key=lambda item: item[1])
+    preferred_score = _existing_database_score(preferred)
+    if best_score > preferred_score and best_score >= 1:
+        log_path = str(best_path)
+        # The logger is configured below; print a clear startup diagnostic before then.
+        print(f"[Unrite] Reusing populated SQLite database: {log_path}")
+        return best_path
+    return preferred
+
+
+if DATABASE_URL_RAW:
+    # Railway provides DATABASE_URL on the app service when it references the PostgreSQL service.
+    DATABASE_TARGET = DATABASE_URL_RAW
+    if DATABASE_TARGET.startswith("postgres://"):
+        DATABASE_TARGET = "postgresql://" + DATABASE_TARGET[len("postgres://"):]
+    DATABASE_KIND = "PostgreSQL"
+else:
+    _database_path = _resolve_database_path(_database_path, DATABASE_PATH_RAW)
+    DATABASE_TARGET = str(_database_path)
+    DATABASE_KIND = "SQLite (local fallback)"
 
 THREAD_NAMES = ("РП мероприятия", "Arena", "Capt", "MCL")
 
@@ -63,7 +141,7 @@ def channel_slug(display_name: str, user_id: int) -> str:
     slug = re.sub(r"[-_]{2,}", "-", slug).strip("-_ ")
     if not slug:
         slug = f"player-{user_id}"
-    return f"архи-{slug}"[:100]
+    return f"・archive-{slug}"[:100]
 
 
 def short_error(exc: Exception) -> str:
@@ -85,8 +163,14 @@ class UnriteBot(commands.Bot):
         intents.messages = True
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
-        self.db = Database(DATABASE_PATH)
+        self.db = Database(DATABASE_TARGET)
         self._creation_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+    async def close(self) -> None:
+        try:
+            await self.db.close()
+        finally:
+            await super().close()
 
     async def setup_hook(self) -> None:
         await self.db.initialize()
@@ -108,6 +192,7 @@ class UnriteBot(commands.Bot):
             log.exception("Failed to sync application commands")
 
     async def on_ready(self) -> None:
+        log.info("Database backend: %s", self.db.backend_label)
         if self.user:
             log.info("Unrite is online as %s (ID: %s)", self.user, self.user.id)
 
@@ -171,7 +256,7 @@ class UnriteBot(commands.Bot):
             rank_role = guild.get_role(rank_role_id) if rank_role_id else None
             rank_text = rank_role.mention if rank_role else f"Ранг {rank_position} (роль не настроена)"
         else:
-            rank_text = "Не назначен"
+            rank_text = "Test"
 
         tier = int(record.get("tier", 0))
         if tier:
@@ -195,7 +280,7 @@ class UnriteBot(commands.Bot):
             description=(
                 f"**Личный канал участника —**\n{owner_label}\n\n"
                 "▸ Присылайте в текстовый канал видео откатов с МП (желательно геймплей от 10 минут с сильными лобби).\n"
-                "▸ Изучайте залазы, это важно для участия в мейн-составе на CAPT\n"
+                "▸ Изучайте залазы, это важно для участия в мейн-составе на CAPT.\n"
                 "▸ Пожалуйста, прикрепляйте откаты с лучшей стрельбой и демонстрацией понимания игры."
             ),
             colour=discord.Colour.from_rgb(27, 28, 33),
@@ -390,7 +475,11 @@ class UnriteBot(commands.Bot):
 
         record = await self.db.get_archive_by_channel(channel_id) if channel_id else None
         if not record:
-            await self.send_ephemeral(interaction, "Эта панель не привязана к архиву Unrite.")
+            await self.send_ephemeral(
+                interaction,
+                "В базе Unrite нет записи для этого канала. Администратор должен обновить бота "
+                "и выполнить `/unrite repair_archive` прямо в этом архиве, чтобы восстановить привязку."
+            )
             return
 
         if not await self.can_manage_feature(interaction, action):
@@ -743,12 +832,12 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
             description=(
                 "📁 **Создание портфеля**\n"
                 "Нажмите кнопку ниже, чтобы создать персональный приватный канал.\n\n"
-                "▸ Участники @Rec в приватном канале оценят ваши откаты и решат — повысить вам тир или порекомендовать дополнительную тренировку, указав на допущенные ошибки..\n"
+                "▸ Участники @Rec в приватном канале оценят ваши откаты и решат — повысить вам тир или порекомендовать дополнительную тренировку, указав на допущенные ошибки.\n"
                 "▸ Видеоматериалы желательно заливать на видеохостинги Youtube, Rutube."
             ),
             colour=discord.Colour.from_rgb(27, 28, 33),
         )
-        embed.set_footer(text="Создай личный канал → прикрепи откаты → @Rec и @Recruit определят твой Ранг и TIER")
+        embed.set_footer(text="Unrite • Личные архивы, ранги и тиры")
         await channel.send(embed=embed, view=CreateArchiveView(self.bot))
         await self.bot.db.set_guild_setting(interaction.guild.id, "panel_channel_id", channel.id)
         await interaction.response.send_message(f"Панель Unrite опубликована в {channel.mention}.", ephemeral=True)
@@ -841,6 +930,119 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
         await self.bot.db.set_guild_setting(interaction.guild.id, "curator_role_id", role.id)
         await interaction.response.send_message(
             f"Роль куратора установлена: {role.mention}.", ephemeral=True
+        )
+
+    @app_commands.command(
+        name="repair_archive",
+        description="Восстановить привязку существующего архива к базе Unrite",
+    )
+    @app_commands.describe(channel="Архивный канал; если не указан, используется текущий канал")
+    async def repair_archive(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        if not await self.require_admin(interaction):
+            return
+        guild = interaction.guild
+        if guild is None:
+            await self.bot.send_ephemeral(interaction, "Команда доступна только на сервере.")
+            return
+
+        target = channel or (interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None)
+        if not isinstance(target, discord.TextChannel):
+            await self.bot.send_ephemeral(
+                interaction, "Укажи текстовый канал архива или запусти команду внутри него."
+            )
+            return
+
+        settings = await self.bot.db.get_guild_settings(guild.id)
+        category_id = settings.get("category_id")
+        if not category_id or target.category_id != int(category_id):
+            await self.bot.send_ephemeral(
+                interaction,
+                "Этот канал не находится в настроенной категории архивов. Проверь `/unrite setup` "
+                "и укажи правильный архивный канал.",
+            )
+            return
+
+        topic = target.topic or ""
+        if not target.name.casefold().startswith("архи-") or not topic.startswith("Unrite | Архив игрока:"):
+            await self.bot.send_ephemeral(
+                interaction,
+                "Не удалось подтвердить, что это архив Unrite: имя или тема канала не совпадают "
+                "с форматом, который создаёт бот.",
+            )
+            return
+
+        owner_match = re.search(r"\bID:\s*(\d+)\s*$", topic, flags=re.IGNORECASE)
+        if not owner_match:
+            await self.bot.send_ephemeral(
+                interaction, "В теме канала не найден ID владельца. Не могу восстановить привязку безопасно."
+            )
+            return
+        owner_id = int(owner_match.group(1))
+        owner = await self.bot.fetch_member_safe(guild, owner_id)
+        if owner is None:
+            await self.bot.send_ephemeral(
+                interaction, f"Владелец с ID `{owner_id}` не найден на сервере. Привязка не изменена."
+            )
+            return
+
+        thread_by_name: dict[str, discord.Thread] = {}
+        for thread in [*guild.threads, *target.threads]:
+            if thread.parent_id == target.id:
+                thread_by_name[thread.name.casefold()] = thread
+        try:
+            async for thread in target.archived_threads(limit=100, private=True, joined=False):
+                thread_by_name[thread.name.casefold()] = thread
+        except (discord.Forbidden, discord.HTTPException, AttributeError):
+            log.warning("Could not enumerate archived threads for archive %s", target.id, exc_info=True)
+
+        thread_ids: dict[str, int] = {}
+        for required_name in THREAD_NAMES:
+            thread = thread_by_name.get(required_name.casefold())
+            if thread is not None:
+                thread_ids[required_name] = thread.id
+        missing = [name for name in THREAD_NAMES if name not in thread_ids]
+        if missing:
+            await self.bot.send_ephemeral(
+                interaction,
+                "Не найдены все четыре ветки, поэтому привязка не изменена. Отсутствуют: "
+                + ", ".join(missing)
+                + ". Проверь, что бот видит приватные ветки и имеет право Manage Threads.",
+            )
+            return
+
+        existing_for_owner = await self.bot.db.get_archive_by_owner(guild.id, owner_id)
+        try:
+            if existing_for_owner:
+                previous_channel_id = int(existing_for_owner["channel_id"])
+                previous_channel = guild.get_channel(previous_channel_id)
+                if previous_channel is not None and previous_channel_id != target.id:
+                    await self.bot.send_ephemeral(
+                        interaction,
+                        f"В базе уже привязан другой существующий канал: {previous_channel.mention}. "
+                        "Ничего не изменено — сначала проверь старый архив.",
+                    )
+                    return
+                await self.bot.db.rebind_archive_channel(
+                    guild.id, owner_id, target.id, thread_ids
+                )
+            else:
+                await self.bot.db.create_archive(guild.id, owner_id, target.id, thread_ids)
+        except Exception as exc:
+            log.exception("Could not repair archive binding for channel %s", target.id)
+            await self.bot.send_ephemeral(
+                interaction,
+                f"Не удалось восстановить привязку ({type(exc).__name__}). Проверь лог бота; данные не удалены.",
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Привязка архива {target.mention} восстановлена. Найдены все четыре ветки; "
+            "теперь действия с рангами и тирами могут работать.",
+            ephemeral=True,
         )
 
     @app_commands.command(name="status", description="Показать текущие настройки Unrite")
