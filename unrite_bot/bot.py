@@ -239,24 +239,78 @@ class UnriteBot(commands.Bot):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
 
+    @staticmethod
+    def detect_rank_position(member: discord.Member, rank_roles: dict[int, int]) -> int:
+        """Return the highest configured rank position matching the member's roles."""
+        member_role_ids = {role.id for role in member.roles}
+        matches = [position for position, role_id in rank_roles.items() if role_id in member_role_ids]
+        return max(matches, default=0)
+
+    async def resolve_archive_threads(
+        self, guild: discord.Guild, record: dict[str, Any]
+    ) -> dict[str, int]:
+        """Resolve saved thread IDs and recover missing IDs from the archive channel if possible."""
+        thread_ids = {str(name): int(thread_id) for name, thread_id in (record.get("thread_ids") or {}).items() if thread_id}
+        wanted = {name.casefold(): name for name in THREAD_NAMES}
+        channel_id = int(record.get("channel_id", 0))
+        missing = {name.casefold() for name in THREAD_NAMES} - {name.casefold() for name in thread_ids}
+        if not missing or not channel_id:
+            return thread_ids
+
+        parent = guild.get_channel(channel_id)
+        if not isinstance(parent, discord.TextChannel):
+            return thread_ids
+
+        candidates: dict[str, discord.Thread] = {}
+        for thread in [*guild.threads, *parent.threads]:
+            if thread.parent_id == channel_id and thread.name.casefold() in wanted:
+                candidates[thread.name.casefold()] = thread
+        if missing - candidates.keys():
+            try:
+                async for thread in parent.archived_threads(limit=100, private=True, joined=False):
+                    if thread.name.casefold() in wanted:
+                        candidates[thread.name.casefold()] = thread
+            except (discord.Forbidden, discord.HTTPException, AttributeError):
+                log.debug("Could not enumerate archived private threads for %s", channel_id, exc_info=True)
+
+        for folded, thread in candidates.items():
+            canonical = wanted.get(folded)
+            if canonical and canonical not in thread_ids:
+                thread_ids[canonical] = thread.id
+
+        if thread_ids != (record.get("thread_ids") or {}):
+            try:
+                await self.db.update_archive(channel_id, thread_ids=thread_ids)
+            except Exception:
+                log.exception("Could not persist recovered thread IDs for archive %s", channel_id)
+        return thread_ids
+
     async def build_archive_embed(self, guild: discord.Guild, record: dict[str, Any]) -> discord.Embed:
         owner = await self.fetch_member_safe(guild, int(record["owner_id"]))
         settings = await self.db.get_guild_settings(guild.id)
         rank_roles = await self.db.list_rank_roles(guild.id)
         tier_roles = await self.db.list_tier_roles(guild.id)
 
+        # The member's configured Discord rank role is the source of truth.
+        # This also repairs stale rank_position values when the card is refreshed.
+        rank_position = int(record.get("rank_position", 0))
+        if owner and rank_roles:
+            detected_position = self.detect_rank_position(owner, rank_roles)
+            if detected_position != rank_position:
+                rank_position = detected_position
+                await self.db.update_archive(int(record["channel_id"]), rank_position=rank_position)
+
         if owner:
             owner_label = f"{owner.mention} (`{owner.display_name}`)"
         else:
             owner_label = f"ID участника: `{record['owner_id']}`"
 
-        rank_position = int(record.get("rank_position", 0))
         if rank_position:
             rank_role_id = rank_roles.get(rank_position)
             rank_role = guild.get_role(rank_role_id) if rank_role_id else None
             rank_text = rank_role.mention if rank_role else f"Ранг {rank_position} (роль не настроена)"
         else:
-            rank_text = "Test"
+            rank_text = "Не назначен"
 
         tier = int(record.get("tier", 0))
         if tier:
@@ -288,11 +342,17 @@ class UnriteBot(commands.Bot):
         embed.add_field(name="Текущий ранг", value=rank_text, inline=True)
         embed.add_field(name="Текущий тир", value=tier_text, inline=True)
         embed.add_field(name="Куратор", value=curator_text, inline=False)
-        embed.add_field(
-            name="Ветки канала",
-            value="`РП мероприятия` · `Arena` · `Capt` · `MCL`",
-            inline=False,
-        )
+
+        thread_ids = await self.resolve_archive_threads(guild, record)
+        branch_lines: list[str] = []
+        for thread_name in THREAD_NAMES:
+            thread_id = thread_ids.get(thread_name)
+            if thread_id:
+                thread_url = f"https://discord.com/channels/{guild.id}/{thread_id}"
+                branch_lines.append(f"• [{thread_name}]({thread_url})")
+            else:
+                branch_lines.append(f"• `{thread_name}` — ссылка не найдена")
+        embed.add_field(name="Ветки канала · нажми для перехода", value="\n".join(branch_lines), inline=False)
         embed.set_footer(text="Unrite • Управление архивом доступно ролям с назначенными разрешениями")
         if owner and owner.display_avatar:
             embed.set_thumbnail(url=owner.display_avatar.url)
@@ -402,13 +462,19 @@ class UnriteBot(commands.Bot):
                 await self.db.create_archive(
                     guild.id, member.id, archive_channel.id, created_thread_ids
                 )
+                # Detect the starting rank from the configured rank roles the member already has.
+                configured_rank_roles = await self.db.list_rank_roles(guild.id)
+                initial_rank_position = self.detect_rank_position(member, configured_rank_roles)
+                if initial_rank_position:
+                    await self.db.update_archive(archive_channel.id, rank_position=initial_rank_position)
+
                 embed = await self.build_archive_embed(
                     guild,
                     {
                         "guild_id": guild.id,
                         "owner_id": member.id,
                         "channel_id": archive_channel.id,
-                        "rank_position": 0,
+                        "rank_position": initial_rank_position,
                         "tier": 0,
                         "curator_assigned": 0,
                         "thread_ids": created_thread_ids,
