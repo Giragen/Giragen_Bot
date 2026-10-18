@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id BIGINT PRIMARY KEY,
     category_id BIGINT,
     panel_channel_id BIGINT,
-    curator_role_id BIGINT
+    curator_role_id BIGINT,
+    tier_checker_role_id BIGINT
 );
 CREATE TABLE IF NOT EXISTS permissions (
     guild_id BIGINT NOT NULL,
@@ -56,6 +57,7 @@ CREATE TABLE IF NOT EXISTS archives (
     tier INTEGER NOT NULL DEFAULT 0,
     curator_assigned INTEGER NOT NULL DEFAULT 0,
     curator_user_id BIGINT,
+    tier_checker_user_id BIGINT,
     thread_ids TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (guild_id, owner_id)
@@ -165,7 +167,8 @@ class Database:
                     guild_id INTEGER PRIMARY KEY,
                     category_id INTEGER,
                     panel_channel_id INTEGER,
-                    curator_role_id INTEGER
+                    curator_role_id INTEGER,
+                    tier_checker_role_id INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS permissions (
@@ -198,17 +201,25 @@ class Database:
                     tier INTEGER NOT NULL DEFAULT 0,
                     curator_assigned INTEGER NOT NULL DEFAULT 0,
                     curator_user_id INTEGER,
+                    tier_checker_user_id INTEGER,
                     thread_ids TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (guild_id, owner_id)
                 );
                 """
             )
-            # Backwards-compatible migration for an existing SQLite database.
+            # Backwards-compatible migrations for existing SQLite databases.
+            settings_cursor = await db.execute("PRAGMA table_info(guild_settings)")
+            settings_columns = {row[1] for row in await settings_cursor.fetchall()}
+            if "tier_checker_role_id" not in settings_columns:
+                await db.execute("ALTER TABLE guild_settings ADD COLUMN tier_checker_role_id INTEGER")
+
             columns_cursor = await db.execute("PRAGMA table_info(archives)")
             archive_columns = {row[1] for row in await columns_cursor.fetchall()}
             if "curator_user_id" not in archive_columns:
                 await db.execute("ALTER TABLE archives ADD COLUMN curator_user_id INTEGER")
+            if "tier_checker_user_id" not in archive_columns:
+                await db.execute("ALTER TABLE archives ADD COLUMN tier_checker_user_id INTEGER")
             await db.commit()
 
     async def _initialize_postgres(self) -> None:
@@ -240,9 +251,15 @@ class Database:
                     for statement in POSTGRES_SCHEMA.split(";"):
                         if statement.strip():
                             await connection.execute(statement)
-                    # Add the field to existing PostgreSQL installations too.
+                    # Backwards-compatible migrations for existing PostgreSQL installations.
+                    await connection.execute(
+                        "ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS tier_checker_role_id BIGINT"
+                    )
                     await connection.execute(
                         "ALTER TABLE archives ADD COLUMN IF NOT EXISTS curator_user_id BIGINT"
+                    )
+                    await connection.execute(
+                        "ALTER TABLE archives ADD COLUMN IF NOT EXISTS tier_checker_user_id BIGINT"
                     )
                 self._pool = pool
                 return
@@ -289,12 +306,13 @@ class Database:
                 "category_id": None,
                 "panel_channel_id": None,
                 "curator_role_id": None,
+                "tier_checker_role_id": None,
             }
         finally:
             await db.close()
 
     async def set_guild_setting(self, guild_id: int, field: str, value: int | None) -> None:
-        allowed_fields = {"category_id", "panel_channel_id", "curator_role_id"}
+        allowed_fields = {"category_id", "panel_channel_id", "curator_role_id", "tier_checker_role_id"}
         if field not in allowed_fields:
             raise ValueError(f"Unsupported guild setting: {field}")
         db = await self._connect()
@@ -506,7 +524,7 @@ class Database:
             await db.close()
 
     async def update_archive(self, channel_id: int, **fields: Any) -> None:
-        allowed_fields = {"rank_position", "tier", "curator_assigned", "curator_user_id", "thread_ids"}
+        allowed_fields = {"rank_position", "tier", "curator_assigned", "curator_user_id", "tier_checker_user_id", "thread_ids"}
         if not fields or not set(fields).issubset(allowed_fields):
             raise ValueError("Invalid archive update fields")
         if "thread_ids" in fields:

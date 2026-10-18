@@ -105,8 +105,8 @@ FEATURE_LABELS = {
     "delete_channel": "Удаление канала",
     "promote_rank": "Повышение ранга",
     "demote_rank": "Понижение ранга",
-    "curator_assign": "Закрепиться / назначить куратора",
-    "curator_unassign": "Открепить куратора",
+    "curator_assign": "Закрепиться как Curator / Tier Checker",
+    "curator_unassign": "Открепить наблюдателя своего типа",
     "tier_1": "Выдать Тир 1",
     "tier_2": "Выдать Тир 2",
     "tier_3": "Выдать Тир 3",
@@ -116,8 +116,8 @@ FEATURE_CHOICES = [
     app_commands.Choice(name="Удалить канал", value="delete_channel"),
     app_commands.Choice(name="Повысить ранг", value="promote_rank"),
     app_commands.Choice(name="Понизить ранг", value="demote_rank"),
-    app_commands.Choice(name="Закрепиться", value="curator_assign"),
-    app_commands.Choice(name="Открепить куратора", value="curator_unassign"),
+    app_commands.Choice(name="Закрепиться (Curator / Tier Checker)", value="curator_assign"),
+    app_commands.Choice(name="Открепить наблюдателя своего типа", value="curator_unassign"),
     app_commands.Choice(name="Выдать Тир 1", value="tier_1"),
     app_commands.Choice(name="Выдать Тир 2", value="tier_2"),
     app_commands.Choice(name="Выдать Тир 3", value="tier_3"),
@@ -384,6 +384,22 @@ class UnriteBot(commands.Bot):
                 log.exception("Could not persist recovered thread IDs for archive %s", channel_id)
         return thread_ids
 
+    @staticmethod
+    def staff_kinds(member: discord.Member, settings: dict[str, Any]) -> set[str]:
+        """Return staff assignment types represented by this member's roles."""
+        configured_curator_id = int(settings.get("curator_role_id") or 0)
+        configured_checker_id = int(settings.get("tier_checker_role_id") or 0)
+        kinds: set[str] = set()
+        for role in member.roles:
+            normalized = re.sub(r"[^a-z0-9]+", "", role.name.casefold())
+            # Tier Checker name/ID wins if the same role was accidentally saved in
+            # both settings; this avoids displaying the checking role as Curator.
+            if (configured_checker_id and role.id == configured_checker_id) or normalized in {"tierchecker", "tiercheck"}:
+                kinds.add("tier_checker")
+            elif (configured_curator_id and role.id == configured_curator_id) or normalized == "curator":
+                kinds.add("curator")
+        return kinds
+
     async def build_archive_embed(self, guild: discord.Guild, record: dict[str, Any]) -> discord.Embed:
         owner = await self.fetch_member_safe(guild, int(record["owner_id"]))
         settings = await self.db.get_guild_settings(guild.id)
@@ -419,29 +435,69 @@ class UnriteBot(commands.Bot):
         else:
             tier_text = "Нет тира"
 
-        # A curator is the staff member who clicked "Закрепиться".
-        # Never grant the staff role to the archive owner.
-        curator_id = record.get("curator_user_id")
-        curator_member = (
-            await self.fetch_member_safe(guild, int(curator_id))
-            if curator_id else None
-        )
+        # Curator and Tier Checker are separate staff assignments. They can be
+        # attached to the same archive at the same time and are rendered comma-separated.
         curator_role_id = settings.get("curator_role_id")
-        configured_curator_role = guild.get_role(int(curator_role_id)) if curator_role_id else None
-        if curator_member:
-            visible_curator_role = (
-                configured_curator_role
-                if configured_curator_role and configured_curator_role in curator_member.roles
-                else next(
-                    (role for role in curator_member.roles
-                     if role.name.casefold().replace(" ", "") in {"tierchecker", "curator"}),
+        tier_checker_role_id = settings.get("tier_checker_role_id")
+
+        # Older versions stored every staff assignment in curator_user_id. If that
+        # member is clearly a Tier Checker (and not a Curator), migrate the slot in
+        # place so the new dual-assignment display doesn't lose the old assignment.
+        legacy_curator_id = record.get("curator_user_id")
+        if legacy_curator_id and not record.get("tier_checker_user_id"):
+            legacy_staff = await self.fetch_member_safe(guild, int(legacy_curator_id))
+            if legacy_staff:
+                legacy_kinds = self.staff_kinds(legacy_staff, settings)
+                if "tier_checker" in legacy_kinds and "curator" not in legacy_kinds:
+                    try:
+                        await self.db.update_archive(
+                            int(record["channel_id"]),
+                            curator_assigned=0,
+                            curator_user_id=None,
+                            tier_checker_user_id=int(legacy_curator_id),
+                        )
+                        record["curator_assigned"] = 0
+                        record["curator_user_id"] = None
+                        record["tier_checker_user_id"] = int(legacy_curator_id)
+                    except Exception:
+                        log.exception(
+                            "Could not migrate legacy Tier Checker assignment for archive %s",
+                            record.get("channel_id"),
+                        )
+
+        async def render_staff_assignment(
+            staff_id: Any, configured_role_id: Any, expected_names: set[str], fallback_title: str
+        ) -> str | None:
+            if not staff_id:
+                return None
+            staff_member = await self.fetch_member_safe(guild, int(staff_id))
+            if staff_member is None:
+                return f"участник не найден (`{staff_id}`) @{fallback_title}"
+            staff_role = guild.get_role(int(configured_role_id)) if configured_role_id else None
+            if staff_role is None:
+                staff_role = next(
+                    (role for role in staff_member.roles
+                     if re.sub(r"[^a-z0-9]+", "", role.name.casefold()) in expected_names),
                     None,
                 )
-            )
-            role_label = f" · {visible_curator_role.mention}" if visible_curator_role else ""
-            curator_text = f"Закреплён — {curator_member.mention}{role_label}"
-        elif curator_id:
-            curator_text = f"Закреплён — участник не найден (`{curator_id}`)"
+            role_label = f" {staff_role.mention}" if staff_role else f" **@{fallback_title}**"
+            return f"{staff_member.mention}{role_label}"
+
+        staff_lines: list[str] = []
+        curator_line = await render_staff_assignment(
+            record.get("curator_user_id"), curator_role_id, {"curator"}, "Curator"
+        )
+        checker_line = await render_staff_assignment(
+            record.get("tier_checker_user_id"), tier_checker_role_id, {"tierchecker", "tiercheck"}, "Tier Checker"
+        )
+        if curator_line:
+            staff_lines.append(curator_line)
+        if checker_line:
+            staff_lines.append(checker_line)
+        if len(staff_lines) == 2:
+            curator_text = f"Закреплены — {staff_lines[0]}, {staff_lines[1]}"
+        elif staff_lines:
+            curator_text = f"Закреплён — {staff_lines[0]}"
         else:
             curator_text = "Не закреплён"
 
@@ -595,6 +651,7 @@ class UnriteBot(commands.Bot):
                         "tier": 0,
                         "curator_assigned": 0,
                         "curator_user_id": None,
+                        "tier_checker_user_id": None,
                         "thread_ids": created_thread_ids,
                     },
                 )
@@ -814,20 +871,31 @@ class UnriteBot(commands.Bot):
         actor: discord.Member,
         assign: bool,
     ) -> None:
-        """Attach/detach a staff member to an archive without changing the owner's roles."""
+        """Attach/detach the acting staff type without changing the archive owner's roles.
+
+        Curator and Tier Checker have independent slots. A member holding both roles
+        updates both slots; otherwise only the matching staff slot is changed.
+        """
+        settings = await self.db.get_guild_settings(guild.id)
+        staff_kinds = self.staff_kinds(actor, settings)
+        is_curator = "curator" in staff_kinds
+        is_tier_checker = "tier_checker" in staff_kinds
+
+        if not is_curator and not is_tier_checker:
+            raise ValueError(
+                "Не удалось определить тип сотрудника. Настрой роли командами "
+                "`/unrite curator_role` и `/unrite tier_checker_role`, либо используй роли "
+                "с названиями `Curator` и `Tier Checker`."
+            )
+
         channel_id = int(record["channel_id"])
-        if assign:
-            await self.db.update_archive(
-                channel_id,
-                curator_assigned=1,
-                curator_user_id=actor.id,
-            )
-        else:
-            await self.db.update_archive(
-                channel_id,
-                curator_assigned=0,
-                curator_user_id=None,
-            )
+        updates: dict[str, Any] = {}
+        if is_curator:
+            updates["curator_assigned"] = 1 if assign else 0
+            updates["curator_user_id"] = actor.id if assign else None
+        if is_tier_checker:
+            updates["tier_checker_user_id"] = actor.id if assign else None
+        await self.db.update_archive(channel_id, **updates)
 
     async def reset_control_view(self, interaction: discord.Interaction) -> None:
         if interaction.message is None:
@@ -862,8 +930,8 @@ class ArchiveActionSelect(discord.ui.Select):
             discord.SelectOption(label="Удалить канал", value="delete_channel", description="Удалить личный архив"),
             discord.SelectOption(label="Повышение ранга", value="promote_rank", description="Выдать следующий настроенный ранг"),
             discord.SelectOption(label="Понижение ранга", value="demote_rank", description="Снять ранг или понизить на один уровень"),
-            discord.SelectOption(label="Закрепиться", value="curator_assign", description="Назначить настроенную роль куратора"),
-            discord.SelectOption(label="Открепить куратора", value="curator_unassign", description="Снять роль куратора"),
+            discord.SelectOption(label="Закрепиться", value="curator_assign", description="Закрепляет Curator и/или Tier Checker по роли сотрудника"),
+            discord.SelectOption(label="Открепиться", value="curator_unassign", description="Снимает назначение соответствующего типа сотрудника"),
         ]
         super().__init__(
             placeholder="Взаимодействие с каналом",
@@ -1148,6 +1216,23 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
             f"Роль сотрудника-куратора установлена: {role.mention}. Она не будет выдаваться владельцам архивов.", ephemeral=True
         )
 
+    @app_commands.command(name="tier_checker_role", description="Указать отображаемую роль сотрудника Tier Checker")
+    @app_commands.describe(role="Роль сотрудника Tier Checker; эта роль НЕ выдаётся владельцу архива")
+    async def tier_checker_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
+        if not await self.require_admin(interaction):
+            return
+        if interaction.guild is None:
+            await self.bot.send_ephemeral(interaction, "Команда доступна только на сервере.")
+            return
+        if role.is_default() or role.managed:
+            await self.bot.send_ephemeral(interaction, "Выберите обычную роль сотрудников Tier Checker.")
+            return
+        await self.bot.db.set_guild_setting(interaction.guild.id, "tier_checker_role_id", role.id)
+        await interaction.response.send_message(
+            f"Роль Tier Checker установлена: {role.mention}. Она не будет выдаваться владельцам архивов.",
+            ephemeral=True,
+        )
+
     @app_commands.command(
         name="repair_archive",
         description="Восстановить привязку существующего архива к базе Unrite",
@@ -1282,6 +1367,7 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
         category = guild.get_channel(settings.get("category_id") or 0)
         panel_channel = guild.get_channel(settings.get("panel_channel_id") or 0)
         curator = guild.get_role(settings.get("curator_role_id") or 0)
+        tier_checker = guild.get_role(settings.get("tier_checker_role_id") or 0)
         tier_roles = await self.bot.db.list_tier_roles(guild.id)
         rank_roles = await self.bot.db.list_rank_roles(guild.id)
         permissions = await self.bot.db.list_permissions(guild.id)
@@ -1289,7 +1375,8 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
         embed = discord.Embed(title="UNRITE • Настройки", colour=discord.Colour.blurple())
         embed.add_field(name="Категория архивов", value=category.mention if category else "Не настроена", inline=False)
         embed.add_field(name="Панель создания", value=panel_channel.mention if panel_channel else "Не опубликована", inline=False)
-        embed.add_field(name="Роль сотрудников-кураторов", value=curator.mention if curator else "Не настроена (в карточке будет отображаться сотрудник)", inline=False)
+        embed.add_field(name="Роль Curator", value=curator.mention if curator else "Не настроена (распознаётся роль с названием Curator)", inline=False)
+        embed.add_field(name="Роль Tier Checker", value=tier_checker.mention if tier_checker else "Не настроена (распознаётся роль с названием Tier Checker)", inline=False)
         embed.add_field(
             name="Роли тиров",
             value="\n".join(
