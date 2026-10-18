@@ -1061,10 +1061,29 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
         if role.is_default():
             await self.bot.send_ephemeral(interaction, "Нельзя назначить функции управления роли `@everyone`.")
             return
-        await self.bot.db.set_permission(interaction.guild.id, role.id, function.value, allowed)
-        await self.bot.refresh_manager_role_access(interaction.guild, role)
+        # This command updates permissions across every saved archive. That can take
+        # longer than Discord's initial interaction response window, so acknowledge
+        # the interaction before any database/network work.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await self.bot.db.set_permission(interaction.guild.id, role.id, function.value, allowed)
+            await self.bot.refresh_manager_role_access(interaction.guild, role)
+        except Exception:
+            log.exception(
+                "Failed to update permission %s for role %s in guild %s",
+                function.value,
+                role.id,
+                interaction.guild.id,
+            )
+            await interaction.followup.send(
+                "Не удалось полностью обновить разрешение. Проверь логи Railway; "
+                "если запись сохранена, повторный запуск этой команды безопасен.",
+                ephemeral=True,
+            )
+            return
+
         state = "разрешена" if allowed else "запрещена"
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Функция **{FEATURE_LABELS[function.value]}** для роли {role.mention} теперь **{state}**.",
             ephemeral=True,
         )
