@@ -419,14 +419,31 @@ class UnriteBot(commands.Bot):
         else:
             tier_text = "Нет тира"
 
-        curator_role_id = settings.get("curator_role_id")
-        curator_role = guild.get_role(curator_role_id) if curator_role_id else None
-        has_curator = bool(
-            owner
-            and curator_role
-            and any(role.id == curator_role.id for role in owner.roles)
+        # A curator is the staff member who clicked "Закрепиться".
+        # Never grant the staff role to the archive owner.
+        curator_id = record.get("curator_user_id")
+        curator_member = (
+            await self.fetch_member_safe(guild, int(curator_id))
+            if curator_id else None
         )
-        curator_text = f"Закреплён — {curator_role.mention}" if has_curator else "Не закреплён"
+        curator_role_id = settings.get("curator_role_id")
+        configured_curator_role = guild.get_role(int(curator_role_id)) if curator_role_id else None
+        if curator_member:
+            visible_curator_role = (
+                configured_curator_role
+                if configured_curator_role and configured_curator_role in curator_member.roles
+                else next(
+                    (role for role in curator_member.roles
+                     if role.name.casefold().replace(" ", "") in {"tierchecker", "curator"}),
+                    None,
+                )
+            )
+            role_label = f" · {visible_curator_role.mention}" if visible_curator_role else ""
+            curator_text = f"Закреплён — {curator_member.mention}{role_label}"
+        elif curator_id:
+            curator_text = f"Закреплён — участник не найден (`{curator_id}`)"
+        else:
+            curator_text = "Не закреплён"
 
         embed = discord.Embed(
             title="—・Личный текстовый канал участника",
@@ -440,7 +457,7 @@ class UnriteBot(commands.Bot):
         )
         embed.add_field(name="Текущий ранг", value=rank_text, inline=True)
         embed.add_field(name="Текущий тир", value=tier_text, inline=True)
-        embed.add_field(name="Куратор", value=curator_text, inline=False)
+        embed.add_field(name="Кто наблюдает за архивом", value=curator_text, inline=False)
 
         thread_ids = await self.resolve_archive_threads(guild, record)
         branch_lines: list[str] = []
@@ -577,6 +594,7 @@ class UnriteBot(commands.Bot):
                         "rank_position": initial_rank_position,
                         "tier": 0,
                         "curator_assigned": 0,
+                        "curator_user_id": None,
                         "thread_ids": created_thread_ids,
                     },
                 )
@@ -688,7 +706,12 @@ class UnriteBot(commands.Bot):
                 tier = int(action[-1])
                 await self.assign_tier(guild, owner, record, tier)
             elif action in {"curator_assign", "curator_unassign"}:
-                await self.change_curator(guild, owner, record, action == "curator_assign")
+                if not isinstance(interaction.user, discord.Member):
+                    await self.send_ephemeral(interaction, "Не удалось определить сотрудника-куратора.")
+                    return
+                await self.change_curator(
+                    guild, owner, record, interaction.user, action == "curator_assign"
+                )
             else:
                 await self.send_ephemeral(interaction, "Неизвестное действие.")
                 return
@@ -788,22 +811,23 @@ class UnriteBot(commands.Bot):
         guild: discord.Guild,
         owner: discord.Member,
         record: dict[str, Any],
+        actor: discord.Member,
         assign: bool,
     ) -> None:
-        settings = await self.db.get_guild_settings(guild.id)
-        role_id = settings.get("curator_role_id")
-        curator_role = guild.get_role(int(role_id)) if role_id else None
-        if curator_role is None:
-            raise ValueError("Роль куратора не настроена. Используйте `/unrite curator_role`.")
-
-        owner_has_role = any(role.id == curator_role.id for role in owner.roles)
-        if assign and not owner_has_role:
-            await owner.add_roles(curator_role, reason="Unrite: закрепление куратора")
-        elif not assign and owner_has_role:
-            await owner.remove_roles(curator_role, reason="Unrite: открепление куратора")
-        await self.db.update_archive(
-            int(record["channel_id"]), curator_assigned=int(assign)
-        )
+        """Attach/detach a staff member to an archive without changing the owner's roles."""
+        channel_id = int(record["channel_id"])
+        if assign:
+            await self.db.update_archive(
+                channel_id,
+                curator_assigned=1,
+                curator_user_id=actor.id,
+            )
+        else:
+            await self.db.update_archive(
+                channel_id,
+                curator_assigned=0,
+                curator_user_id=None,
+            )
 
     async def reset_control_view(self, interaction: discord.Interaction) -> None:
         if interaction.message is None:
@@ -1089,8 +1113,8 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
             ephemeral=True,
         )
 
-    @app_commands.command(name="curator_role", description="Выбрать роль для действия «Закрепиться»")
-    @app_commands.describe(role="Роль куратора, которая будет назначаться игроку")
+    @app_commands.command(name="curator_role", description="Указать отображаемую роль сотрудника-куратора")
+    @app_commands.describe(role="Роль сотрудника-куратора; эта роль НЕ выдаётся владельцу архива")
     async def curator_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
         if not await self.require_admin(interaction):
             return
@@ -1098,11 +1122,11 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
             await self.bot.send_ephemeral(interaction, "Команда доступна только на сервере.")
             return
         if role.is_default() or role.managed:
-            await self.bot.send_ephemeral(interaction, "Выберите обычную серверную роль, которую бот сможет выдавать.")
+            await self.bot.send_ephemeral(interaction, "Выберите обычную роль сотрудников-кураторов.")
             return
         await self.bot.db.set_guild_setting(interaction.guild.id, "curator_role_id", role.id)
         await interaction.response.send_message(
-            f"Роль куратора установлена: {role.mention}.", ephemeral=True
+            f"Роль сотрудника-куратора установлена: {role.mention}. Она не будет выдаваться владельцам архивов.", ephemeral=True
         )
 
     @app_commands.command(
@@ -1246,7 +1270,7 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
         embed = discord.Embed(title="UNRITE • Настройки", colour=discord.Colour.blurple())
         embed.add_field(name="Категория архивов", value=category.mention if category else "Не настроена", inline=False)
         embed.add_field(name="Панель создания", value=panel_channel.mention if panel_channel else "Не опубликована", inline=False)
-        embed.add_field(name="Роль куратора", value=curator.mention if curator else "Не настроена", inline=False)
+        embed.add_field(name="Роль сотрудников-кураторов", value=curator.mention if curator else "Не настроена (в карточке будет отображаться сотрудник)", inline=False)
         embed.add_field(
             name="Роли тиров",
             value="\n".join(

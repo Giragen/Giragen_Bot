@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS archives (
     rank_position INTEGER NOT NULL DEFAULT 0,
     tier INTEGER NOT NULL DEFAULT 0,
     curator_assigned INTEGER NOT NULL DEFAULT 0,
+    curator_user_id BIGINT,
     thread_ids TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (guild_id, owner_id)
@@ -196,12 +197,18 @@ class Database:
                     rank_position INTEGER NOT NULL DEFAULT 0,
                     tier INTEGER NOT NULL DEFAULT 0,
                     curator_assigned INTEGER NOT NULL DEFAULT 0,
+                    curator_user_id INTEGER,
                     thread_ids TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (guild_id, owner_id)
                 );
                 """
             )
+            # Backwards-compatible migration for an existing SQLite database.
+            columns_cursor = await db.execute("PRAGMA table_info(archives)")
+            archive_columns = {row[1] for row in await columns_cursor.fetchall()}
+            if "curator_user_id" not in archive_columns:
+                await db.execute("ALTER TABLE archives ADD COLUMN curator_user_id INTEGER")
             await db.commit()
 
     async def _initialize_postgres(self) -> None:
@@ -233,6 +240,10 @@ class Database:
                     for statement in POSTGRES_SCHEMA.split(";"):
                         if statement.strip():
                             await connection.execute(statement)
+                    # Add the field to existing PostgreSQL installations too.
+                    await connection.execute(
+                        "ALTER TABLE archives ADD COLUMN IF NOT EXISTS curator_user_id BIGINT"
+                    )
                 self._pool = pool
                 return
             except Exception as exc:
@@ -495,7 +506,7 @@ class Database:
             await db.close()
 
     async def update_archive(self, channel_id: int, **fields: Any) -> None:
-        allowed_fields = {"rank_position", "tier", "curator_assigned", "thread_ids"}
+        allowed_fields = {"rank_position", "tier", "curator_assigned", "curator_user_id", "thread_ids"}
         if not fields or not set(fields).issubset(allowed_fields):
             raise ValueError("Invalid archive update fields")
         if "thread_ids" in fields:
