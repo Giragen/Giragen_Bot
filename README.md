@@ -116,6 +116,12 @@ python .\migrate_sqlite_to_postgres.py --sqlite .\data\unrite.sqlite3
 
 В сервисе Unrite добавьте `DATABASE_URL` именно как reference variable, указывающую на PostgreSQL service. Если сервис базы называется `Postgres`, выражение будет `${{Postgres.DATABASE_URL}}`. Railway документирует этот способ подключения в [PostgreSQL Docs](https://docs.railway.com/databases/postgresql) и [Variables](https://docs.railway.com/variables).
 
+## Автоматическое распределение архивов по категориям
+
+Discord ограничивает каждую категорию 50 каналами. В этой версии Unrite автоматически выбирает категорию с местом: сначала основную, указанную через `/unrite setup`, затем категории с именами `Имя категории (2)`, `Имя категории (3)` и так далее. Если все имеющиеся категории заполнены, бот создаёт следующую категорию-копию по разрешениям основной. Существующие архивы не перемещаются. Команда `/unrite repair_archive` принимает основную и созданные таким способом дополнительные категории.
+
+Если видишь `asyncpg.pool | Failed to restore the pool connection floor` вместе с `ConnectionRefusedError` на порту `5432`, это отдельная проблема доступности PostgreSQL, а не лимит Discord. В Railway проверь, что сервис PostgreSQL запущен и healthy, открой логи именно сервиса PostgreSQL, а в сервисе бота переменная `DATABASE_URL` задана как Railway reference variable на `DATABASE_URL` PostgreSQL-сервиса в том же проекте и environment. Не публикуй строку подключения целиком: в ней есть пароль. Подробности — в [официальной документации Railway по PostgreSQL](https://docs.railway.com/databases/postgresql).
+
 ## 5. Запуск через Docker
 
 Скопируйте `.env.example` в `.env`, заполните `DISCORD_TOKEN` и выполните:

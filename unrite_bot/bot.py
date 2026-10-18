@@ -152,6 +152,13 @@ def short_error(exc: Exception) -> str:
         )
     if isinstance(exc, discord.NotFound):
         return "Объект Discord уже удалён или недоступен. Обновите настройки и повторите."
+    if isinstance(exc, discord.HTTPException):
+        details = str(getattr(exc, "text", "") or exc)
+        if getattr(exc, "code", None) == 50035 and "Maximum number of channels in category reached" in details:
+            return (
+                "В выбранной категории достигнут лимит Discord (50 каналов). "
+                "Обновите Unrite до версии с автоматическим распределением архивов по дополнительным категориям."
+            )
     return f"Не удалось выполнить действие: `{type(exc).__name__}`. Подробности записаны в лог."
 
 
@@ -165,6 +172,9 @@ class UnriteBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.db = Database(DATABASE_TARGET)
         self._creation_locks: dict[tuple[int, int], asyncio.Lock] = {}
+        # Serialize parent-channel creation per server to avoid two users racing
+        # for the 50th slot in the same Discord category.
+        self._category_locks: dict[int, asyncio.Lock] = {}
 
     async def close(self) -> None:
         try:
@@ -238,6 +248,95 @@ class UnriteBot(commands.Bot):
             return await guild.fetch_member(member_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
+
+    @staticmethod
+    def category_index_for_archive_set(
+        category: discord.CategoryChannel, base_category: discord.CategoryChannel
+    ) -> int | None:
+        """Return 1 for the configured category, N for its numbered siblings, else None."""
+        if category.id == base_category.id or category.name.casefold() == base_category.name.casefold():
+            return 1
+        match = re.fullmatch(
+            rf"{re.escape(base_category.name)} \((\d+)\)",
+            category.name,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        number = int(match.group(1))
+        return number if number >= 2 else None
+
+    async def resolve_archive_category(
+        self, guild: discord.Guild, base_category: discord.CategoryChannel
+    ) -> discord.CategoryChannel:
+        """Choose a category in the configured category family with room for another channel.
+
+        Discord allows at most 50 channels in each category. When all existing
+        categories are full, create a sibling named `Base (2)`, `Base (3)`, etc.
+        """
+        related: list[tuple[int, discord.CategoryChannel]] = []
+        seen: set[int] = set()
+        for candidate in guild.categories:
+            index = self.category_index_for_archive_set(candidate, base_category)
+            if index is not None and candidate.id not in seen:
+                related.append((index, candidate))
+                seen.add(candidate.id)
+        if base_category.id not in seen:
+            related.append((1, base_category))
+        related.sort(key=lambda item: item[0])
+
+        for _, candidate in related:
+            if len(candidate.channels) < 50:
+                return candidate
+
+        next_index = max((index for index, _ in related), default=1) + 1
+        # Leave space for the numbered suffix under Discord's 100-character name limit.
+        suffix = f" ({next_index})"
+        new_name = base_category.name[: 100 - len(suffix)].rstrip() + suffix
+        return await guild.create_category(
+            name=new_name,
+            position=base_category.position,
+            overwrites=base_category.overwrites,
+            reason="Unrite: automatic archive category rotation (category limit reached)",
+        )
+
+    async def create_archive_text_channel(
+        self,
+        guild: discord.Guild,
+        base_category: discord.CategoryChannel,
+        *,
+        name: str,
+        topic: str,
+        overwrites: dict[Any, discord.PermissionOverwrite],
+        reason: str,
+    ) -> discord.TextChannel:
+        """Create the archive in a category with capacity, retrying a full-category race."""
+        category_lock = self._category_locks.setdefault(guild.id, asyncio.Lock())
+        for attempt in range(3):
+            async with category_lock:
+                category = await self.resolve_archive_category(guild, base_category)
+                try:
+                    return await guild.create_text_channel(
+                        name=name,
+                        category=category,
+                        topic=topic,
+                        overwrites=overwrites,
+                        reason=reason,
+                    )
+                except discord.HTTPException as exc:
+                    details = str(getattr(exc, "text", "") or exc)
+                    is_full = (
+                        getattr(exc, "code", None) == 50035
+                        and "Maximum number of channels in category reached" in details
+                    )
+                    if not is_full or attempt >= 2:
+                        raise
+                    log.warning(
+                        "Archive category %s filled during creation; selecting another category (attempt %s)",
+                        category.id, attempt + 1,
+                    )
+            await asyncio.sleep(0.2)
+        raise RuntimeError("Не удалось выбрать категорию с доступным местом для архива.")
 
     @staticmethod
     def detect_rank_position(member: discord.Member, rank_roles: dict[int, int]) -> int:
@@ -437,9 +536,10 @@ class UnriteBot(commands.Bot):
             created_thread_ids: dict[str, int] = {}
             try:
                 safe_name = channel_slug(member.display_name, member.id)
-                archive_channel = await guild.create_text_channel(
+                archive_channel = await self.create_archive_text_channel(
+                    guild,
+                    category,
                     name=safe_name,
-                    category=category,
                     topic=f"Unrite | Архив игрока: {member.display_name} | ID: {member.id}",
                     overwrites=overwrites,
                     reason=f"Unrite: личный архив для {member} ({member.id})",
@@ -488,7 +588,13 @@ class UnriteBot(commands.Bot):
                         await archive_channel.delete(reason="Unrite: rollback after creation error")
                     except discord.HTTPException:
                         pass
-                    await self.db.delete_archive(archive_channel.id)
+                    try:
+                        await self.db.delete_archive(archive_channel.id)
+                    except Exception:
+                        log.exception(
+                            "Could not remove archive database record during rollback for channel %s",
+                            archive_channel.id,
+                        )
                 await interaction.followup.send(
                     f"Не удалось создать личный архив. {short_error(exc)}", ephemeral=True
                 )
@@ -871,8 +977,8 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
             return False
         return True
 
-    @app_commands.command(name="setup", description="Указать категорию, где бот создаёт личные архивы")
-    @app_commands.describe(category="Категория для новых архивов")
+    @app_commands.command(name="setup", description="Указать основную категорию для личных архивов")
+    @app_commands.describe(category="Основная категория; при заполнении бот создаст категории с суффиксами (2), (3) и т. д.")
     async def setup(self, interaction: discord.Interaction, category: discord.CategoryChannel) -> None:
         if not await self.require_admin(interaction):
             return
@@ -881,7 +987,10 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
             return
         await self.bot.db.set_guild_setting(interaction.guild.id, "category_id", category.id)
         await interaction.response.send_message(
-            f"Категория архивов Unrite установлена: {category.mention}.", ephemeral=True
+            f"Основная категория архивов Unrite установлена: {category.mention}.\n"
+            "Если в категории станет 50 каналов, бот автоматически продолжит в дополнительных категориях "
+            f"`{category.name} (2)`, `{category.name} (3)` и далее.",
+            ephemeral=True,
         )
 
     @app_commands.command(name="panel", description="Опубликовать панель создания личного архива")
@@ -1022,16 +1131,24 @@ class UnriteSettingsCog(commands.GroupCog, group_name="unrite", group_descriptio
 
         settings = await self.bot.db.get_guild_settings(guild.id)
         category_id = settings.get("category_id")
-        if not category_id or target.category_id != int(category_id):
+        base_category = guild.get_channel(int(category_id)) if category_id else None
+        target_category = target.category
+        is_archive_category = (
+            isinstance(base_category, discord.CategoryChannel)
+            and isinstance(target_category, discord.CategoryChannel)
+            and self.bot.category_index_for_archive_set(target_category, base_category) is not None
+        )
+        if not is_archive_category:
             await self.bot.send_ephemeral(
                 interaction,
-                "Этот канал не находится в настроенной категории архивов. Проверь `/unrite setup` "
-                "и укажи правильный архивный канал.",
+                "Этот канал не находится в основной категории архивов или автоматически созданной дополнительной категории. "
+                "Проверь `/unrite setup` и выбери исходную категорию.",
             )
             return
 
         topic = target.topic or ""
-        if not target.name.casefold().startswith("архи-") or not topic.startswith("Unrite | Архив игрока:"):
+        valid_name = target.name.casefold().startswith(("архи-", "・archive-", "archive-"))
+        if not valid_name or not topic.startswith("Unrite | Архив игрока:"):
             await self.bot.send_ephemeral(
                 interaction,
                 "Не удалось подтвердить, что это архив Unrite: имя или тема канала не совпадают "
